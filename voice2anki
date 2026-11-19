@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# voice2anki: capture English words by voice while gaming and turn them into Anki cards.
+#
+#   voice2anki toggle        press 1: record word, press 2: record sentence, press 3: done
+#   voice2anki game NAME     set the game name stored on new cards ("" to clear)
+#   voice2anki flush         retry translations and push queued cards into Anki
+#   voice2anki status        show current state and queue
+#   voice2anki cancel        abort the current recording
+set -uo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+APP_DIR="$(dirname "$SELF")"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/voice2anki"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/voice2anki"
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/voice2anki"
+
+# ---- defaults (override in ~/.config/voice2anki/config.sh) ----
+WHISPER_PYTHON="python3"           # python with faster-whisper installed
+WHISPER_MODEL="small.en"
+CLAUDE_MODEL="sonnet"
+TARGET_LANG="Ukrainian"
+ANKI_FLATPAK="net.ankiweb.Anki"    # empty if Anki is not a Flatpak
+ANKI_COLLECTION=""                 # path to collection.anki2 (needed when Anki is closed)
+NOTE_TYPE="voice2anki"
+DECK="English"
+FIELD_WORD="Word"
+FIELD_TRANSLATION="Translation"
+FIELD_SENTENCE="Sentence"
+FIELD_GAME="Game"
+TAG="voice2anki"
+MAX_SECONDS=30
+# shellcheck disable=SC1091
+[ -f "$CONFIG_DIR/config.sh" ] && . "$CONFIG_DIR/config.sh"
+export WHISPER_MODEL CLAUDE_MODEL TARGET_LANG NOTE_TYPE DECK TAG \
+       FIELD_WORD FIELD_TRANSLATION FIELD_SENTENCE FIELD_GAME
+
+mkdir -p "$DATA_DIR" "$RUN_DIR" "$CONFIG_DIR"
+QUEUE="$DATA_DIR/queue.jsonl"
+LOCK="$DATA_DIR/queue.lock"
+LOG="$DATA_DIR/voice2anki.log"
+STATE_FILE="$RUN_DIR/state"
+PID_FILE="$RUN_DIR/rec.pid"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+beep() { canberra-gtk-play -i "$1" >/dev/null 2>&1 & }
+notify() { notify-send -a voice2anki -t "${3:-4000}" "$1" "${2:-}" >/dev/null 2>&1 || true; }
+state() { cat "$STATE_FILE" 2>/dev/null || echo idle; }
+
+start_rec() { # $1 = output wav
+  timeout -s INT "$MAX_SECONDS" pw-record --rate 16000 --channels 1 "$1" >/dev/null 2>&1 &
+  echo $! >"$PID_FILE"
+}
+
+stop_rec() {
+  local pid; pid="$(cat "$PID_FILE" 2>/dev/null)" || return 0
+  kill -INT "$pid" 2>/dev/null
+  for _ in $(seq 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.05; done
+  rm -f "$PID_FILE"
+}
+
+cmd_toggle() {
+  case "$(state)" in
+    idle)
+      rm -f "$RUN_DIR"/word.wav "$RUN_DIR"/sentence.wav
+      beep message-new-instant
+      start_rec "$RUN_DIR/word.wav"
+      echo word >"$STATE_FILE"
+      ;;
+    word)
+      stop_rec
+      beep message-new-instant
+      start_rec "$RUN_DIR/sentence.wav"
+      echo sentence >"$STATE_FILE"
+      ;;
+    sentence)
+      stop_rec
+      echo idle >"$STATE_FILE"
+      beep complete
+      local job="$DATA_DIR/jobs/$(date +%Y%m%d-%H%M%S)"
+      mkdir -p "$job"
+      mv "$RUN_DIR"/word.wav "$job"/ 2>/dev/null
+      mv "$RUN_DIR"/sentence.wav "$job"/ 2>/dev/null
+      cat "$CONFIG_DIR/game" >"$job/game" 2>/dev/null || : >"$job/game"
+      setsid nohup "$SELF" _process "$job" >>"$LOG" 2>&1 &
+      ;;
+  esac
+}
+
+cmd_cancel() { stop_rec; echo idle >"$STATE_FILE"; beep dialog-warning; }
+
+cmd_process() { # internal: $1 = job dir
+  local job="$1"
+  ( flock 9; "$WHISPER_PYTHON" "$APP_DIR/v2a_process.py" capture "$job" "$QUEUE" ) 9>"$LOCK"
+  local rc=$?
+  if [ $rc -eq 0 ]; then rm -rf "$job"; else log "job $job failed (rc=$rc), kept for debugging"; fi
+  cmd_flush
+}
+
+anki_running() {
+  if [ -n "$ANKI_FLATPAK" ] && flatpak ps --columns=application 2>/dev/null | grep -qx "$ANKI_FLATPAK"; then
+    return 0
+  fi
+  pgrep -x anki >/dev/null 2>&1
+}
+
+cmd_flush() {
+  [ -s "$QUEUE" ] || return 0
+  (
+    flock 9
+    "$WHISPER_PYTHON" "$APP_DIR/v2a_process.py" retranslate "$QUEUE" || true
+    if anki_running; then
+      # Anki is open: use AnkiConnect if installed, otherwise wait until Anki is closed.
+      python3 "$APP_DIR/v2a_ankiconnect.py" "$QUEUE" || log "Anki is open without AnkiConnect, cards stay queued"
+    elif [ -n "$ANKI_COLLECTION" ]; then
+      if [ -n "$ANKI_FLATPAK" ]; then
+        flatpak run --filesystem="$APP_DIR":ro --filesystem="$DATA_DIR" \
+          --command=python3 "$ANKI_FLATPAK" -I "$APP_DIR/v2a_import.py" "$ANKI_COLLECTION" "$QUEUE"
+      else
+        python3 "$APP_DIR/v2a_import.py" "$ANKI_COLLECTION" "$QUEUE"
+      fi
+    else
+      log "ANKI_COLLECTION is not set, cannot import while Anki is closed"
+    fi
+  ) 9>"$LOCK" >>"$LOG" 2>&1
+}
+
+cmd_status() {
+  echo "state: $(state)"
+  echo "game:  $(cat "$CONFIG_DIR/game" 2>/dev/null || echo '-')"
+  if [ -s "$QUEUE" ]; then
+    echo "queued cards: $(wc -l <"$QUEUE")"
+    python3 -c 'import json,sys
+for l in open(sys.argv[1]):
+    d=json.loads(l); print("  -", d["word"], "->", d.get("translation") or "(translation pending)")' "$QUEUE"
+  else
+    echo "queued cards: 0"
+  fi
+}
+
+case "${1:-}" in
+  toggle) cmd_toggle ;;
+  cancel) cmd_cancel ;;
+  game)   shift; if [ -n "${1:-}" ]; then printf '%s' "$*" >"$CONFIG_DIR/game"; else rm -f "$CONFIG_DIR/game"; fi
+          echo "game: ${*:-(none)}" ;;
+  flush)  cmd_flush ;;
+  status) cmd_status ;;
+  _process) cmd_process "$2" ;;
+  *) sed -n '2,9p' "$SELF" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
